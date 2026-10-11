@@ -107,6 +107,76 @@ export function pickFiles(accept?: string, multiple = true): Promise<File[]> {
   })
 }
 
+/** Extensions relevant to the Open dialogs (client + server items). */
+export const CLIENT_FILE_EXTENSIONS = ['dat', 'spr', 'otfi', 'otb', 'xml']
+
+/** Keeps only client/server-item files (a picked folder may contain anything). */
+export function filterClientFiles(files: File[]): File[] {
+  return files.filter((f) => CLIENT_FILE_EXTENSIONS.includes(extname(f.name)))
+}
+
+interface DirectoryHandleLike {
+  name: string
+  values(): AsyncIterable<{ kind: string; name: string; getFile?: () => Promise<File> }>
+}
+
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: (options?: { mode?: 'read' | 'readwrite' }) => Promise<DirectoryHandleLike>
+}
+
+export interface PickedDirectory {
+  name: string
+  files: File[]
+}
+
+/**
+ * Lets the user pick a folder. Uses the File System Access API when available
+ * (Chromium), otherwise an `<input webkitdirectory>`. Only top-level files are
+ * returned. Must be called from a user gesture. Resolves null when canceled.
+ */
+export async function pickDirectory(
+  win: DirectoryPickerWindow = window
+): Promise<PickedDirectory | null> {
+  if (typeof win.showDirectoryPicker === 'function') {
+    let handle: DirectoryHandleLike
+    try {
+      handle = await win.showDirectoryPicker({ mode: 'read' })
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return null
+      throw err
+    }
+    const files: File[] = []
+    for await (const entry of handle.values()) {
+      if (entry.kind === 'file' && entry.getFile) files.push(await entry.getFile())
+    }
+    return { name: handle.name, files }
+  }
+
+  return new Promise((resolve) => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.multiple = true
+    input.setAttribute('webkitdirectory', '')
+    input.style.display = 'none'
+    const done = (value: PickedDirectory | null): void => {
+      input.remove()
+      resolve(value)
+    }
+    input.addEventListener('change', () => {
+      const all = Array.from(input.files ?? [])
+      if (all.length === 0) return done(null)
+      // webkitRelativePath is "<folder>/<sub>/<file>": keep top-level files only
+      const rel = (f: File): string[] =>
+        ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).split('/')
+      const name = rel(all[0]).length > 1 ? rel(all[0])[0] : 'folder'
+      done({ name, files: all.filter((f) => rel(f).length <= 2) })
+    })
+    input.addEventListener('cancel', () => done(null))
+    document.body.appendChild(input)
+    input.click()
+  })
+}
+
 function acceptFromFilters(filters?: { extensions: string[] }[]): string | undefined {
   const exts = filters?.flatMap((f) => f.extensions).filter((e) => e && e !== '*')
   return exts && exts.length > 0 ? exts.map((e) => `.${e}`).join(',') : undefined
@@ -155,6 +225,12 @@ export interface WebApi extends ElectronAPI {
     vfs: VirtualFileSystem
     /** Registers local files (picked or dropped) and opens the "Open" dialog. */
     openFiles(files: File[]): void
+    /** File picker for client files (select .dat + .spr together). Returns the virtual dir. */
+    pickClientFiles(): Promise<string | null>
+    /** Returns (and clears) the directory of files dropped/preloaded but not yet used. */
+    consumePendingDirectory(): string | null
+    /** Called whenever dropped/preloaded files become available. Returns cleanup. */
+    onFilesReady(cb: (directory: string) => void): () => void
     dispatchMenuAction(action: MenuAction): void
   }
 }
@@ -167,6 +243,7 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
   let recent: Record<string, string | null> = loadJson(RECENT_KEY, {})
   /** Files dropped/opened outside the dialog, consumed by the next directory dialog. */
   let pendingDirectory: string | null = null
+  const filesReadyListeners = new Set<(directory: string) => void>()
 
   /** Actions dispatched before the app subscribed (e.g. preload on startup). */
   const queuedActions: MenuAction[] = []
@@ -197,13 +274,13 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
           pendingDirectory = null
           return { canceled: false, directoryPath: dir }
         }
-        // Browsers can't hand out a directory path: let the user pick the
-        // client files (Tibia.dat + Tibia.spr, optionally .otfi/.otb/.xml).
-        const files = await pickFiles('.dat,.spr,.otfi,.otb,.xml', true)
-        if (files.length === 0) return { canceled: true, directoryPath: null }
+        // Browsers can't hand out a real path: read the folder's files into the VFS.
+        const picked = await pickDirectory()
+        if (!picked) return { canceled: true, directoryPath: null }
+        const dir = `${WEB_ROOT}/${picked.name || 'folder'}`
         vfs.clear()
-        vfs.addAll(files)
-        return { canceled: false, directoryPath: WEB_ROOT }
+        vfs.addAll(filterClientFiles(picked.files), dir)
+        return { canceled: false, directoryPath: dir }
       },
       readBinary: (p) => readBlob(vfs, p),
       async writeBinary(p, data) {
@@ -394,7 +471,29 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
         vfs.clear()
         vfs.addAll(files)
         pendingDirectory = WEB_ROOT
-        dispatchMenuAction(MENU_FILE_OPEN as MenuAction)
+        if (filesReadyListeners.size > 0) {
+          // Open dialog already listening: let it pick the files up directly
+          filesReadyListeners.forEach((cb) => cb(WEB_ROOT))
+        } else {
+          dispatchMenuAction(MENU_FILE_OPEN as MenuAction)
+        }
+      },
+      async pickClientFiles() {
+        const files = await pickFiles('.dat,.spr,.otfi', true)
+        if (files.length === 0) return null
+        vfs.clear()
+        vfs.addAll(files)
+        pendingDirectory = null
+        return WEB_ROOT
+      },
+      consumePendingDirectory() {
+        const dir = pendingDirectory
+        pendingDirectory = null
+        return dir
+      },
+      onFilesReady(cb) {
+        filesReadyListeners.add(cb)
+        return () => filesReadyListeners.delete(cb)
       },
       dispatchMenuAction
     }
