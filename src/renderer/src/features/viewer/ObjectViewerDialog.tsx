@@ -283,6 +283,7 @@ export function ObjectViewerDialog({
   }, [isPlaying, open])
 
   // Reset state when dialog opens
+  const wasOpenRef = useRef(open)
   useEffect(() => {
     if (open) {
       setSourceMode('editing')
@@ -307,10 +308,14 @@ export function ObjectViewerDialog({
         setPatternX(0)
         setFrameGroupType(FGT.DEFAULT)
       }
-    } else {
+    } else if (wasOpenRef.current) {
+      // Only reset the shared animation store when the dialog actually closes.
+      // Clearing it while closed (e.g. on every editingThingData change) would
+      // stop the Preview panel animation, which uses the same store.
       useAnimationStore.getState().clearFrameGroup()
       cancelAnimationFrame(animFrameRef.current)
     }
+    wasOpenRef.current = open
   }, [open, editingThingData])
 
   // Load OBD file
