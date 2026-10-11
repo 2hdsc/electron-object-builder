@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { createWebApi, VirtualFileSystem, WEB_ROOT } from '../web-api'
+import { createWebApi, preloadFromQuery, VirtualFileSystem, WEB_ROOT } from '../web-api'
 import { MENU_FILE_OPEN } from '../../../../shared/menu-actions'
 
 function file(name: string, bytes: number[]): File {
@@ -75,5 +75,40 @@ describe('createWebApi', () => {
     expect(await api.settings.get('deleteAfterPaste')).toBe(true)
     expect(await createWebApi().settings.get('deleteAfterPaste')).toBe(true)
     await api.settings.reset()
+  })
+})
+
+describe('preloadFromQuery', () => {
+  const loc = (search: string) => ({
+    search,
+    href: `https://example.test/ob/${search}`,
+    origin: 'https://example.test'
+  })
+
+  it('fetches same-origin dat/spr and queues the open dialog until the app subscribes', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => new Response(new Uint8Array([7])))
+    const api = createWebApi()
+    const ok = await preloadFromQuery(api, loc('?dat=nto/Tibia.dat&spr=nto/Tibia.spr'))
+    expect(ok).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(api.web.vfs.list(WEB_ROOT)).toEqual(['/web/Tibia.dat', '/web/Tibia.spr'])
+
+    const onAction = vi.fn()
+    api.menu.onAction(onAction)
+    await new Promise((r) => setTimeout(r, 0))
+    expect(onAction).toHaveBeenCalledWith(MENU_FILE_OPEN)
+    fetchMock.mockRestore()
+  })
+
+  it('refuses cross-origin URLs and ignores incomplete params', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const api = createWebApi()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(await preloadFromQuery(api, loc('?dat=https://evil.test/a.dat&spr=b.spr'))).toBe(false)
+    expect(await preloadFromQuery(api, loc('?dat=a.dat'))).toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
   })
 })

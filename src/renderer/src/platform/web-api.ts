@@ -168,7 +168,14 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
   /** Files dropped/opened outside the dialog, consumed by the next directory dialog. */
   let pendingDirectory: string | null = null
 
+  /** Actions dispatched before the app subscribed (e.g. preload on startup). */
+  const queuedActions: MenuAction[] = []
+
   const dispatchMenuAction = (action: MenuAction): void => {
+    if (menuListeners.size === 0) {
+      queuedActions.push(action)
+      return
+    }
     menuListeners.forEach((cb) => cb(action))
   }
 
@@ -350,6 +357,10 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
       getState: async () => menuState,
       onAction(cb) {
         menuListeners.add(cb)
+        if (queuedActions.length > 0) {
+          const actions = queuedActions.splice(0)
+          setTimeout(() => actions.forEach((a) => cb(a)), 0)
+        }
         return () => menuListeners.delete(cb)
       }
     },
@@ -406,5 +417,40 @@ export function installWebApi(): WebApi {
     e.preventDefault()
     api.web.openFiles(files)
   })
+
+  void preloadFromQuery(api, window.location)
   return api
+}
+
+/**
+ * Optional preload for private deployments: `?dat=<url>&spr=<url>[&otfi=<url>]`.
+ * Only same-origin URLs are accepted. Assets are never bundled in the build;
+ * the deployment decides whether to host them next to index.html.
+ */
+export async function preloadFromQuery(
+  api: WebApi,
+  location: Pick<Location, 'search' | 'href' | 'origin'>
+): Promise<boolean> {
+  const params = new URLSearchParams(location.search)
+  const entries = (['dat', 'spr', 'otfi'] as const)
+    .map((key) => [key, params.get(key)] as const)
+    .filter((e): e is readonly ['dat' | 'spr' | 'otfi', string] => !!e[1])
+  if (!entries.some(([k]) => k === 'dat') || !entries.some(([k]) => k === 'spr')) return false
+
+  try {
+    const files: File[] = []
+    for (const [, value] of entries) {
+      const url = new URL(value, location.href)
+      if (url.origin !== location.origin) throw new Error(`Cross-origin preload refused: ${url}`)
+      const res = await fetch(url)
+      if (!res.ok) throw new Error(`Failed to fetch ${url.pathname}: ${res.status}`)
+      const name = decodeURIComponent(url.pathname.split('/').pop() || 'file')
+      files.push(new File([await res.blob()], name))
+    }
+    api.web.openFiles(files)
+    return true
+  } catch (err) {
+    console.error('[ob] preload failed:', err)
+    return false
+  }
 }
