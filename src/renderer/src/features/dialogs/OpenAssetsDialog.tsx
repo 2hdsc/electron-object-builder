@@ -6,7 +6,7 @@
  * and version. Optional server items directory for OTB/XML loading.
  */
 
-import React, { useState, useCallback, useMemo } from 'react'
+import React, { useState, useCallback, useMemo, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Modal,
@@ -23,6 +23,12 @@ import { FeatureFlagsGroup } from './FeatureFlagsGroup'
 import { useFeatureFlags, applyVersionDefaults } from './useFeatureFlags'
 import type { Version } from '../../types/version'
 import type { SpriteDimension } from '../../types/project'
+import type { WebApi } from '../../platform/web-api'
+
+/** Web build helpers, present only when running in a browser (not Electron). */
+function getWebHelpers(): WebApi['web'] | undefined {
+  return (window.api as Partial<WebApi> | undefined)?.web
+}
 
 interface ClientFilesInfo {
   datFile: string
@@ -91,6 +97,91 @@ export function OpenAssetsDialog({
     []
   )
 
+  const loadClientDirectory = useCallback(
+    async (dir: string) => {
+      setClientDirectory(dir)
+      setError(null)
+      setLoading(true)
+
+      try {
+        // Discover DAT/SPR files in the directory
+        const discovery = await window.api.project.discoverClientFiles(dir)
+
+        if (!discovery.datFile || !discovery.sprFile) {
+          const found = discovery.datFile ?? discovery.sprFile
+          setError(
+            found
+              ? `Only ${found.split('/').pop()} was found. Select both the .dat and the .spr ` +
+                  '(Cmd/Ctrl+click both files), or pick the folder that contains them.'
+              : 'No DAT/SPR files found in the selected folder.'
+          )
+          setClientInfo(null)
+          setLoading(false)
+          return
+        }
+
+        // Read file headers to get signatures and counts
+        const datBuffer = await window.api.file.readBinary(discovery.datFile)
+        const sprBuffer = await window.api.file.readBinary(discovery.sprFile)
+
+        // Parse DAT header: signature (u32) + 4x maxId (u16)
+        const datView = new DataView(datBuffer)
+        const datSignature = datView.getUint32(0, true)
+        const maxItemId = datView.getUint16(4, true)
+        const maxOutfitId = datView.getUint16(6, true)
+        const maxEffectId = datView.getUint16(8, true)
+        const maxMissileId = datView.getUint16(10, true)
+
+        // Parse SPR header: signature (u32) + count (u16 or u32)
+        const sprView = new DataView(sprBuffer)
+        const sprSignature = sprView.getUint32(0, true)
+
+        // Detect version by signatures
+        const version = findVersionBySignatures(datSignature, sprSignature) ?? null
+        const isExtended = version ? version.value >= 960 : false
+        const spritesCount = isExtended ? sprView.getUint32(4, true) : sprView.getUint16(4, true)
+
+        const info: ClientFilesInfo = {
+          datFile: discovery.datFile,
+          sprFile: discovery.sprFile,
+          datSignature,
+          sprSignature,
+          itemsCount: maxItemId,
+          outfitsCount: maxOutfitId,
+          effectsCount: maxEffectId,
+          missilesCount: maxMissileId,
+          spritesCount,
+          version
+        }
+
+        setClientInfo(info)
+
+        if (version) {
+          setFlags(
+            applyVersionDefaults(
+              {
+                extended: false,
+                transparency: false,
+                improvedAnimations: false,
+                frameGroups: false
+              },
+              version.value
+            )
+          )
+        }
+
+        // Save recent directory
+        await window.api.recent.set('lastDirectory', dir)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to read client files.')
+        setClientInfo(null)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [setFlags]
+  )
+
   const handleBrowseClient = useCallback(async () => {
     if (!window.api?.file) return
 
@@ -101,76 +192,28 @@ export function OpenAssetsDialog({
 
     if (result.canceled || !result.directoryPath) return
 
-    const dir = result.directoryPath
-    setClientDirectory(dir)
-    setError(null)
-    setLoading(true)
+    await loadClientDirectory(result.directoryPath)
+  }, [lastDirectory, loadClientDirectory])
 
-    try {
-      // Discover DAT/SPR files in the directory
-      const discovery = await window.api.project.discoverClientFiles(dir)
+  // Web build only: pick Tibia.dat + Tibia.spr directly (multi-select)
+  const handleSelectClientFiles = useCallback(async () => {
+    const web = getWebHelpers()
+    if (!web) return
+    const dir = await web.pickClientFiles()
+    if (dir) await loadClientDirectory(dir)
+  }, [loadClientDirectory])
 
-      if (!discovery.datFile || !discovery.sprFile) {
-        setError('No DAT/SPR files found in the selected folder.')
-        setClientInfo(null)
-        setLoading(false)
-        return
-      }
-
-      // Read file headers to get signatures and counts
-      const datBuffer = await window.api.file.readBinary(discovery.datFile)
-      const sprBuffer = await window.api.file.readBinary(discovery.sprFile)
-
-      // Parse DAT header: signature (u32) + 4x maxId (u16)
-      const datView = new DataView(datBuffer)
-      const datSignature = datView.getUint32(0, true)
-      const maxItemId = datView.getUint16(4, true)
-      const maxOutfitId = datView.getUint16(6, true)
-      const maxEffectId = datView.getUint16(8, true)
-      const maxMissileId = datView.getUint16(10, true)
-
-      // Parse SPR header: signature (u32) + count (u16 or u32)
-      const sprView = new DataView(sprBuffer)
-      const sprSignature = sprView.getUint32(0, true)
-
-      // Detect version by signatures
-      const version = findVersionBySignatures(datSignature, sprSignature) ?? null
-      const isExtended = version ? version.value >= 960 : false
-      const spritesCount = isExtended ? sprView.getUint32(4, true) : sprView.getUint16(4, true)
-
-      const info: ClientFilesInfo = {
-        datFile: discovery.datFile,
-        sprFile: discovery.sprFile,
-        datSignature,
-        sprSignature,
-        itemsCount: maxItemId,
-        outfitsCount: maxOutfitId,
-        effectsCount: maxEffectId,
-        missilesCount: maxMissileId,
-        spritesCount,
-        version
-      }
-
-      setClientInfo(info)
-
-      if (version) {
-        setFlags(
-          applyVersionDefaults(
-            { extended: false, transparency: false, improvedAnimations: false, frameGroups: false },
-            version.value
-          )
-        )
-      }
-
-      // Save recent directory
-      await window.api.recent.set('lastDirectory', dir)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to read client files.')
-      setClientInfo(null)
-    } finally {
-      setLoading(false)
-    }
-  }, [lastDirectory, setFlags])
+  // Web build only: auto-fill with files that were dropped or preloaded (?dat=&spr=)
+  useEffect(() => {
+    const web = getWebHelpers()
+    if (!open || !web) return
+    const pending = web.consumePendingDirectory()
+    if (pending) void loadClientDirectory(pending)
+    return web.onFilesReady(() => {
+      const dir = web.consumePendingDirectory()
+      if (dir) void loadClientDirectory(dir)
+    })
+  }, [open, loadClientDirectory])
 
   const handleBrowseServer = useCallback(async () => {
     if (!window.api?.file) return
@@ -251,6 +294,19 @@ export function OpenAssetsDialog({
         {/* Client folder */}
         <FieldGroup label={t('controls.clientFolder')}>
           <BrowseField label="Folder" value={clientDirectory} onBrowse={handleBrowseClient} />
+          {getWebHelpers() && (
+            <div className="mt-2 flex items-center justify-end gap-2">
+              <span className="text-xs text-text-secondary">or select Tibia.dat + Tibia.spr</span>
+              <button
+                type="button"
+                className="shrink-0 rounded-full border border-border px-4 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-bg-hover active:bg-bg-tertiary"
+                onClick={handleSelectClientFiles}
+                data-testid="select-client-files"
+              >
+                Select files
+              </button>
+            </div>
+          )}
         </FieldGroup>
 
         {loading && (
