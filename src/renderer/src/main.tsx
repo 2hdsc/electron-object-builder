@@ -5,6 +5,12 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import { App } from './App'
 import './i18n' // Initialize i18next before rendering
 import './styles/global.css'
+import { installWebApi } from './platform/web-api'
+
+// Web build: no Electron preload, provide window.api backed by the File API
+if (import.meta.env.VITE_PLATFORM === 'web' && !window.api) {
+  installWebApi()
+}
 
 // ---------------------------------------------------------------------------
 // Global error handlers (renderer process)

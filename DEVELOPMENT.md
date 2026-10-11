@@ -259,6 +259,22 @@ const CATEGORIES = [
 {CATEGORIES.map(c => <Tab key={c.value}>{t(c.labelKey)}</Tab>)}
 ```
 
+## Web Build (browser, view-only)
+
+The renderer can also run in a regular browser, without Electron:
+
+```bash
+npm run dev:web      # http://localhost:5174 (Vite dev server)
+npm run build:web    # static files in out/web
+npm run preview:web  # serves out/web on http://localhost:4174
+```
+
+- `vite.web.config.ts` builds `src/renderer` standalone and defines `import.meta.env.VITE_PLATFORM = web`.
+- In that mode `main.tsx` installs `src/renderer/src/platform/web-api.ts` as `window.api`. It mirrors the preload API but is backed by an in-memory virtual file system: files picked with **Open** (choose `Tibia.dat` + `Tibia.spr`, optionally `.otfi`) or dragged onto the window are read with the File API. Nothing is uploaded.
+- DAT/SPR parsing already lives in the renderer (services + Web Workers), so both builds share the same code. Electron builds are unaffected (`window.api` comes from the preload).
+- Writes (compile/export) fall back to browser downloads; file watching, updater, recovery and the log file are no-ops. Focus for now is viewing.
+- Real client check (read-only): `OB_CLIENT_DIR=/path/to/things/860 npx vitest run real-client` validates object/sprite counts and a DAT/SPR read-write-read round-trip.
+
 ## Testing Strategy
 
 ### Unit & Component Tests (Vitest)
