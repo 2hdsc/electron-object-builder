@@ -166,8 +166,8 @@
     "replace": "Replace",
     "resettingDuplicateSprites": "Resetting duplicate",
     "result": "Result",
-    "rotateLeft90": "Rotate left 90\u00b0",
-    "rotateRight90": "Rotate right 90\u00b0",
+    "rotateLeft90": "Rotate left 90°",
+    "rotateRight90": "Rotate right 90°",
     "rows": "Rows",
     "save": "Save",
     "searchingForUnusedSprites": "Searching for unused sprites",
@@ -379,7 +379,13 @@
     "help": "Help",
     "helpContents": "Help Contents",
     "checkForUpdate": "Check For Updates",
-    "about": "About"
+    "about": "About",
+    "recent": "Open Recent",
+    "noRecent": "No recent files",
+    "clearRecent": "Clear Recent",
+    "recentReselect": "Select {{files}} again (the browser could not keep access to them).",
+    "recentDenied": "Permission denied. Use File > Open to pick the folder again.",
+    "recentFailed": "Could not reopen this entry. Use File > Open."
   },
   "toolTip": {
     "clip": "Borders",
@@ -428,7 +434,7 @@
     "invalidXML": "Invalid XML"
   },
   "splash": {
-    "message": "\u00a9 2014-2023 Mignari nailsonnego@gmail.com | punkice3407. See the legal notices in the About Box.",
+    "message": "© 2014-2023 Mignari nailsonnego@gmail.com | punkice3407. See the legal notices in the About Box.",
     "loadingSettings": "Loading settings"
   },
   "alert": {

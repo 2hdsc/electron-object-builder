@@ -17,6 +17,14 @@ import { createDefaultMenuState, MENU_FILE_OPEN } from '../../../shared/menu-act
 import { createObjectBuilderSettings, createDefaultWindowState } from '../../../shared/settings'
 import type { ObjectBuilderSettings } from '../../../shared/settings'
 import { createProjectState } from '../../../shared/project-state'
+import {
+  RecentsStore,
+  ensureReadPermission,
+  type DirectoryHandleLike,
+  type FileHandleLike,
+  type RecentEntry,
+  type RecentSource
+} from './web-recents'
 import type { ProjectState } from '../../../shared/project-state'
 
 export const WEB_ROOT = '/web'
@@ -115,18 +123,59 @@ export function filterClientFiles(files: File[]): File[] {
   return files.filter((f) => CLIENT_FILE_EXTENSIONS.includes(extname(f.name)))
 }
 
-interface DirectoryHandleLike {
-  name: string
-  values(): AsyncIterable<{ kind: string; name: string; getFile?: () => Promise<File> }>
-}
-
 type DirectoryPickerWindow = Window & {
   showDirectoryPicker?: (options?: { mode?: 'read' | 'readwrite' }) => Promise<DirectoryHandleLike>
+  showOpenFilePicker?: (options?: {
+    multiple?: boolean
+    types?: { description?: string; accept: Record<string, string[]> }[]
+  }) => Promise<FileHandleLike[]>
 }
 
 export interface PickedDirectory {
   name: string
   files: File[]
+  /** Present when the File System Access API was used (can be persisted) */
+  handle?: DirectoryHandleLike
+}
+
+export interface PickedFiles {
+  files: File[]
+  /** Present when the File System Access API was used (can be persisted) */
+  handles?: FileHandleLike[]
+}
+
+/** Reads the top-level files of a directory handle. */
+export async function readDirectoryHandle(handle: DirectoryHandleLike): Promise<File[]> {
+  const files: File[] = []
+  for await (const entry of handle.values()) {
+    if (entry.kind === 'file' && entry.getFile) files.push(await entry.getFile())
+  }
+  return files
+}
+
+/**
+ * Lets the user pick client files (.dat + .spr together). Uses showOpenFilePicker
+ * when available so the handles can be remembered, otherwise `<input multiple>`.
+ */
+export async function pickClientFileSet(win: DirectoryPickerWindow = window): Promise<PickedFiles> {
+  if (typeof win.showOpenFilePicker === 'function') {
+    try {
+      const handles = await win.showOpenFilePicker({
+        multiple: true,
+        types: [
+          {
+            description: 'Client files',
+            accept: { 'application/octet-stream': ['.dat', '.spr', '.otfi'] }
+          }
+        ]
+      })
+      return { files: await Promise.all(handles.map((h) => h.getFile())), handles }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return { files: [] }
+      throw err
+    }
+  }
+  return { files: await pickFiles('.dat,.spr,.otfi', true) }
 }
 
 /**
@@ -145,11 +194,7 @@ export async function pickDirectory(
       if (err instanceof DOMException && err.name === 'AbortError') return null
       throw err
     }
-    const files: File[] = []
-    for await (const entry of handle.values()) {
-      if (entry.kind === 'file' && entry.getFile) files.push(await entry.getFile())
-    }
-    return { name: handle.name, files }
+    return { name: handle.name, files: await readDirectoryHandle(handle), handle }
   }
 
   return new Promise((resolve) => {
@@ -224,7 +269,7 @@ export interface WebApi extends ElectronAPI {
   web: {
     vfs: VirtualFileSystem
     /** Registers local files (picked or dropped) and opens the "Open" dialog. */
-    openFiles(files: File[]): void
+    openFiles(files: File[], source?: RecentSource, options?: { autoConfirm?: boolean }): void
     /** File picker for client files (select .dat + .spr together). Returns the virtual dir. */
     pickClientFiles(): Promise<string | null>
     /** Returns (and clears) the directory of files dropped/preloaded but not yet used. */
@@ -232,10 +277,26 @@ export interface WebApi extends ElectronAPI {
     /** Called whenever dropped/preloaded files become available. Returns cleanup. */
     onFilesReady(cb: (directory: string) => void): () => void
     dispatchMenuAction(action: MenuAction): void
+    /** Remembers how the current files were opened (recorded as recent on load). */
+    setSource(source: RecentSource | null): void
+    /** Returns (and clears) whether the Open dialog should confirm automatically. */
+    consumeAutoConfirm(): boolean
+    /** Recently opened sets (IndexedDB), newest first. */
+    listRecents(): Promise<RecentEntry[]>
+    clearRecents(): Promise<void>
+    removeRecent(id: string): Promise<void>
+    onRecentsChanged(cb: () => void): () => void
+    /**
+     * Reopens a recent entry (call from a click: may prompt for permission or
+     * for re-selecting the files). Loads directly when possible.
+     */
+    reopenRecent(entry: RecentEntry): Promise<ReopenResult>
   }
 }
 
-export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
+export type ReopenResult = 'opened' | 'canceled' | 'permission-denied' | 'failed'
+
+export function createWebApi(vfs = new VirtualFileSystem(), recents = new RecentsStore()): WebApi {
   const menuListeners = new Set<(action: MenuAction) => void>()
   let menuState: MenuState = createDefaultMenuState()
   let projectState: ProjectState = createProjectState()
@@ -244,6 +305,31 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
   /** Files dropped/opened outside the dialog, consumed by the next directory dialog. */
   let pendingDirectory: string | null = null
   const filesReadyListeners = new Set<(directory: string) => void>()
+  const recentsListeners = new Set<() => void>()
+  /** How the files currently in the VFS were opened */
+  let currentSource: RecentSource | null = null
+  let autoConfirm = false
+
+  const notifyRecents = (): void => recentsListeners.forEach((cb) => cb())
+
+  /** Puts files in the VFS and hands them to the Open dialog (opening it if needed). */
+  const deliverFiles = (
+    files: File[],
+    dir: string,
+    source: RecentSource | null,
+    auto: boolean
+  ): void => {
+    vfs.clear()
+    vfs.addAll(files, dir)
+    currentSource = source
+    pendingDirectory = dir
+    autoConfirm = auto
+    if (filesReadyListeners.size > 0) {
+      filesReadyListeners.forEach((cb) => cb(dir))
+    } else {
+      dispatchMenuAction(MENU_FILE_OPEN as MenuAction)
+    }
+  }
 
   /** Actions dispatched before the app subscribed (e.g. preload on startup). */
   const queuedActions: MenuAction[] = []
@@ -278,8 +364,12 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
         const picked = await pickDirectory()
         if (!picked) return { canceled: true, directoryPath: null }
         const dir = `${WEB_ROOT}/${picked.name || 'folder'}`
+        const files = filterClientFiles(picked.files)
         vfs.clear()
-        vfs.addAll(filterClientFiles(picked.files), dir)
+        vfs.addAll(files, dir)
+        currentSource = picked.handle
+          ? { kind: 'directory', name: picked.name, handle: picked.handle }
+          : { kind: 'files', name: picked.name, fileNames: files.map((f) => f.name) }
         return { canceled: false, directoryPath: dir }
       },
       readBinary: (p) => readBlob(vfs, p),
@@ -358,6 +448,13 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
           sprSignature: params.sprSignature,
           features: params.features,
           loadedFileName: basename(params.datFilePath).replace(/\.dat$/i, '')
+        }
+        if (currentSource) {
+          const detail = `${Math.floor(params.versionValue / 100)}.${String(params.versionValue % 100).padStart(2, '0')}`
+          recents
+            .add(currentSource, detail)
+            .then(notifyRecents)
+            .catch((err) => console.warn('[ob] could not save recent:', err))
         }
         return {
           datBuffer,
@@ -466,24 +563,27 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
     },
     web: {
       vfs,
-      openFiles(files) {
+      openFiles(files, source, options) {
         if (files.length === 0) return
-        vfs.clear()
-        vfs.addAll(files)
-        pendingDirectory = WEB_ROOT
-        if (filesReadyListeners.size > 0) {
-          // Open dialog already listening: let it pick the files up directly
-          filesReadyListeners.forEach((cb) => cb(WEB_ROOT))
-        } else {
-          dispatchMenuAction(MENU_FILE_OPEN as MenuAction)
-        }
+        deliverFiles(
+          files,
+          WEB_ROOT,
+          source ?? { kind: 'files', name: 'files', fileNames: files.map((f) => f.name) },
+          options?.autoConfirm ?? false
+        )
       },
       async pickClientFiles() {
-        const files = await pickFiles('.dat,.spr,.otfi', true)
-        if (files.length === 0) return null
+        const picked = await pickClientFileSet()
+        if (picked.files.length === 0) return null
         vfs.clear()
-        vfs.addAll(files)
+        vfs.addAll(picked.files)
         pendingDirectory = null
+        currentSource = {
+          kind: 'files',
+          name: 'files',
+          fileNames: picked.files.map((f) => f.name),
+          handles: picked.handles
+        }
         return WEB_ROOT
       },
       consumePendingDirectory() {
@@ -495,11 +595,80 @@ export function createWebApi(vfs = new VirtualFileSystem()): WebApi {
         filesReadyListeners.add(cb)
         return () => filesReadyListeners.delete(cb)
       },
-      dispatchMenuAction
+      dispatchMenuAction,
+      setSource(source) {
+        currentSource = source
+      },
+      consumeAutoConfirm() {
+        const value = autoConfirm
+        autoConfirm = false
+        return value
+      },
+      listRecents: () => recents.list().catch(() => []),
+      async clearRecents() {
+        await recents.clear()
+        notifyRecents()
+      },
+      async removeRecent(id) {
+        await recents.remove(id)
+        notifyRecents()
+      },
+      onRecentsChanged(cb) {
+        recentsListeners.add(cb)
+        return () => recentsListeners.delete(cb)
+      },
+      async reopenRecent(entry) {
+        const source = entry.source
+        try {
+          if (source.kind === 'directory') {
+            if (!(await ensureReadPermission(source.handle))) return 'permission-denied'
+            const files = filterClientFiles(await readDirectoryHandle(source.handle))
+            deliverFiles(files, `${WEB_ROOT}/${source.name}`, source, true)
+            return 'opened'
+          }
+          if (source.kind === 'files' && source.handles && source.handles.length > 0) {
+            for (const h of source.handles) {
+              if (!(await ensureReadPermission(h))) return 'permission-denied'
+            }
+            const files = await Promise.all(source.handles.map((h) => h.getFile()))
+            deliverFiles(files, WEB_ROOT, source, true)
+            return 'opened'
+          }
+          if (source.kind === 'files') {
+            // No persisted handles (browser without File System Access API): reselect
+            const picked = await pickClientFileSet()
+            if (picked.files.length === 0) return 'canceled'
+            deliverFiles(
+              picked.files,
+              WEB_ROOT,
+              {
+                kind: 'files',
+                name: 'files',
+                fileNames: picked.files.map((f) => f.name),
+                handles: picked.handles
+              },
+              true
+            )
+            return 'opened'
+          }
+          const ok = await preloadFromQuery(api, recentPreloadLocation(source.search), true)
+          return ok ? 'opened' : 'failed'
+        } catch (err) {
+          console.error('[ob] reopen failed:', err)
+          return 'failed'
+        }
+      }
     }
   }
 
   return api
+}
+
+function recentPreloadLocation(search: string): Pick<Location, 'search' | 'href' | 'origin'> {
+  const here = typeof window !== 'undefined' ? window.location : undefined
+  const origin = here?.origin ?? 'http://localhost'
+  const base = here ? `${here.origin}${here.pathname}` : `${origin}/`
+  return { search, href: `${base}${search}`, origin }
 }
 
 /** Installs the web API on `window` plus a global drag-and-drop handler. */
@@ -528,7 +697,8 @@ export function installWebApi(): WebApi {
  */
 export async function preloadFromQuery(
   api: WebApi,
-  location: Pick<Location, 'search' | 'href' | 'origin'>
+  location: Pick<Location, 'search' | 'href' | 'origin'>,
+  autoConfirm = false
 ): Promise<boolean> {
   const params = new URLSearchParams(location.search)
   const entries = (['dat', 'spr', 'otfi'] as const)
@@ -546,7 +716,11 @@ export async function preloadFromQuery(
       const name = decodeURIComponent(url.pathname.split('/').pop() || 'file')
       files.push(new File([await res.blob()], name))
     }
-    api.web.openFiles(files)
+    const params2 = new URLSearchParams()
+    entries.forEach(([k, v]) => params2.set(k, v))
+    const search = `?${params2.toString()}`
+    const source: RecentSource = { kind: 'preload', name: search, search }
+    api.web.openFiles(files, source, { autoConfirm })
     return true
   } catch (err) {
     console.error('[ob] preload failed:', err)

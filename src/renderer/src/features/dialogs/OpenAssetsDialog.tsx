@@ -6,7 +6,7 @@
  * and version. Optional server items directory for OTB/XML loading.
  */
 
-import React, { useState, useCallback, useMemo, useEffect } from 'react'
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Modal,
@@ -203,16 +203,21 @@ export function OpenAssetsDialog({
     if (dir) await loadClientDirectory(dir)
   }, [loadClientDirectory])
 
+  // Web build only: reopening a recent entry confirms automatically once detected
+  const autoConfirmRef = useRef(false)
+
   // Web build only: auto-fill with files that were dropped or preloaded (?dat=&spr=)
   useEffect(() => {
     const web = getWebHelpers()
     if (!open || !web) return
-    const pending = web.consumePendingDirectory()
-    if (pending) void loadClientDirectory(pending)
-    return web.onFilesReady(() => {
+    const take = (): void => {
       const dir = web.consumePendingDirectory()
-      if (dir) void loadClientDirectory(dir)
-    })
+      if (!dir) return
+      autoConfirmRef.current = web.consumeAutoConfirm()
+      void loadClientDirectory(dir)
+    }
+    take()
+    return web.onFilesReady(take)
   }, [open, loadClientDirectory])
 
   const handleBrowseServer = useCallback(async () => {
@@ -262,6 +267,13 @@ export function OpenAssetsDialog({
     onConfirm,
     onClose
   ])
+
+  useEffect(() => {
+    if (autoConfirmRef.current && clientInfo?.version && !loading) {
+      autoConfirmRef.current = false
+      handleConfirm()
+    }
+  }, [clientInfo, loading, handleConfirm])
 
   const handleClose = useCallback(() => {
     setClientDirectory('')

@@ -43,6 +43,7 @@ import {
 import type { ThingData } from './types/things'
 import { getDefaultDuration } from './types/settings'
 import { Toolbar } from './components/Toolbar'
+import { WebMenuBar } from './components/WebMenuBar'
 import { Modal, DialogButton } from './components/Modal'
 import { SplitPane } from './components/SplitPane'
 import { StatusBar } from './components/StatusBar'
@@ -849,6 +850,7 @@ export function App(): React.JSX.Element {
 
   return (
     <div className="flex h-full flex-col">
+      {'web' in (window.api ?? {}) && <WebMenuBar onAction={handleAction} />}
       <Toolbar onAction={handleAction} />
 
       <div className="flex flex-1 flex-col overflow-hidden">
